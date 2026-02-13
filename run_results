@@ -1,0 +1,44 @@
+{
+  "source_notebook": "Wk5_run_metrics.ipynb",
+  "training_runs": [
+    {
+      "run": "baseline_fp32",
+      "use_amp_requested": false,
+      "use_amp_active": false,
+      "use_ckpt": false,
+      "epochs": 1,
+      "max_steps": 300,
+      "train_time_sec": 1215.12,
+      "peak_gpu_mem_mb": null,
+      "val_perplexity": 33.026
+    },
+    {
+      "run": "mixed_precision",
+      "use_amp_requested": true,
+      "use_amp_active": false,
+      "use_ckpt": false,
+      "epochs": 1,
+      "max_steps": 300,
+      "train_time_sec": 1453.52,
+      "peak_gpu_mem_mb": null,
+      "val_perplexity": 32.926
+    },
+    {
+      "run": "amp_plus_checkpointing",
+      "use_amp_requested": true,
+      "use_amp_active": false,
+      "use_ckpt": true,
+      "epochs": 1,
+      "max_steps": 300,
+      "train_time_sec": 1654.75,
+      "peak_gpu_mem_mb": null,
+      "val_perplexity": 32.425
+    }
+  ],
+  "sample_generation": {
+    "prompt": "Homarus gammarus , known as the European lobster or common lobster , is a species of clawed lobster from the eastern Atlantic Ocean , Mediterranean Sea",
+    "reference": "and parts of the Black Sea . It is closely related to the American lobster , H. americanus . It may grow to a length of 60 cm",
+    "generated_continuation": ", and the Gulf of Mexico . It is a common lobster in the United States , Canada , and Mexico . It is a common lobster in the United",
+    "smoothed_bleu": 0.10832996189306149
+  }
+}
