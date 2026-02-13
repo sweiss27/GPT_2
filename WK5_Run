@@ -1,0 +1,500 @@
+# Wk5_run_metrics (Rendered Markdown Copy)
+
+> Auto-generated from `Wk5_run_metrics.ipynb` to provide a GitHub-renderable fallback view.
+
+## Cell 1 (markdown)
+
+# Week 5 Run Metrics (GPT-2)
+
+This notebook runs GPT-2 fine-tuning experiments and collects training/evaluation metrics.
+
+If GitHub rendering is inconsistent, open this notebook in **nbviewer** for a stable preview.
+
+## Cell 2 (code)
+
+```python
+%pip install -q "transformers[torch]" datasets evaluate sacrebleu nltk psutil matplotlib
+```
+Output:
+```text
+Note: you may need to restart the kernel to use updated packages.
+```
+
+## Cell 3 (code)
+
+```python
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import torch
+print("CUDA available:", torch.cuda.is_available())
+print("Device:", "cuda" if torch.cuda.is_available() else "cpu")
+```
+Output:
+```text
+CUDA available: False
+Device: cpu
+```
+
+## Cell 4 (code)
+
+```python
+from datasets import load_dataset
+raw = load_dataset("wikitext", "wikitext-2-raw-v1")
+raw
+```
+Output:
+```text
+DatasetDict({
+    test: Dataset({
+        features: ['text'],
+        num_rows: 4358
+    })
+    train: Dataset({
+        features: ['text'],
+        num_rows: 36718
+    })
+    validation: Dataset({
+        features: ['text'],
+        num_rows: 3760
+    })
+})
+```
+
+## Cell 5 (code)
+
+```python
+def clean_texts(ds):
+    texts = [t for t in ds["text"] if t and not t.isspace()]
+    return texts
+
+train_texts = clean_texts(raw["train"])
+val_texts   = clean_texts(raw["validation"])
+
+print(len(train_texts), len(val_texts))
+print(train_texts[0][:200])
+```
+Output:
+```text
+23767 2461
+ = Valkyria Chronicles III =
+```
+
+## Cell 6 (code)
+
+```python
+from transformers import GPT2TokenizerFast
+
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+# GPT-2 has no pad token by default, so we reuse EOS for padding
+tokenizer.pad_token = tokenizer.eos_token
+
+block_size = 128
+
+def tokenize_batch(texts):
+    return tokenizer(
+        texts,
+        truncation=True,
+        max_length=block_size,
+        padding="max_length"
+    )
+```
+
+## Cell 7 (code)
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import math, time
+
+def chunk_list(lst, n_chunks):
+    chunk_size = math.ceil(len(lst) / n_chunks)
+    return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
+
+def threaded_tokenize(texts, n_threads=4):
+    chunks = chunk_list(texts, n_threads)
+
+    t0 = time.time()
+    results = []
+    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+        futures = [ex.submit(tokenize_batch, c) for c in chunks]
+        for f in futures:
+            results.append(f.result())
+    t1 = time.time()
+
+    # merge dicts-of-lists
+    merged = {k: sum([r[k] for r in results], []) for k in results[0].keys()}
+    print(f"Threaded tokenization: {len(texts)} texts in {t1-t0:.2f}s using {n_threads} threads")
+    return merged
+
+train_tokens = threaded_tokenize(train_texts[:20000], n_threads=4)  # subset for faster runs
+val_tokens   = threaded_tokenize(val_texts[:2000], n_threads=4)
+```
+Output:
+```text
+Threaded tokenization: 20000 texts in 1.26s using 4 threads
+Threaded tokenization: 2000 texts in 0.11s using 4 threads
+```
+
+## Cell 8 (code)
+
+```python
+import torch
+from torch.utils.data import DataLoader
+from datasets import Dataset
+from transformers import DataCollatorForLanguageModeling
+
+train_ds = Dataset.from_dict(train_tokens)
+val_ds   = Dataset.from_dict(val_tokens)
+
+def to_torch(batch):
+    return {k: torch.tensor(v) for k, v in batch.items()}
+
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, collate_fn=data_collator)
+val_loader   = DataLoader(val_ds, batch_size=4, shuffle=False, collate_fn=data_collator)
+```
+
+## Cell 9 (code)
+
+```python
+import torch
+import time
+from math import exp
+from transformers import GPT2LMHeadModel
+
+def get_device():
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+@torch.no_grad()
+def evaluate_perplexity(model, loader, device, max_eval_batches=100):
+    """
+    Perplexity evaluation capped to avoid long eval runs.
+    """
+    model.eval()
+    losses = []
+    for i, batch in enumerate(loader):
+        if i >= max_eval_batches:
+            break
+        batch = {k: v.to(device) for k, v in batch.items()}
+        out = model(**batch)
+        losses.append(out.loss.item())
+    model.train()
+    avg_loss = sum(losses) / max(1, len(losses))
+    return exp(avg_loss)
+
+def train_one_run(run_name, use_amp=False, use_ckpt=False, epochs=1, lr=5e-5, max_steps=300, log_every=50):
+    """
+    Trains GPT-2 for a limited number of steps so experiments finish quickly.
+    Returns: (model, results_dict)
+    """
+    device = get_device()
+    model = GPT2LMHeadModel.from_pretrained("gpt2")
+
+    if use_ckpt:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+
+    model.to(device)
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    # AMP setup
+    amp_active = (use_amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda") if amp_active else None
+
+    # memory tracking
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    t0 = time.time()
+
+    step_count = 0
+    for epoch in range(epochs):
+        for _, batch in enumerate(train_loader):
+            step_count += 1
+            if step_count > max_steps:
+                break
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            optimizer.zero_grad(set_to_none=True)
+
+            if scaler is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    out = model(**batch)
+                    loss = out.loss
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                out = model(**batch)
+                loss = out.loss
+                loss.backward()
+                optimizer.step()
+
+            if step_count == 1 or step_count % log_every == 0:
+                print(f"[{run_name}] epoch {epoch} step {step_count}/{max_steps} loss {loss.item():.4f}")
+
+        if step_count > max_steps:
+            break
+
+    t1 = time.time()
+
+    peak_mb = None
+    if device.type == "cuda":
+        peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+
+    # eval perplexity (capped for speed)
+    ppl = evaluate_perplexity(model, val_loader, device, max_eval_batches=100)
+
+    results = {
+        "run": run_name,
+        "use_amp_requested": use_amp,
+        "use_amp_active": amp_active,
+        "use_ckpt": use_ckpt,
+        "epochs": epochs,
+        "max_steps": max_steps,
+        "train_time_sec": round(t1 - t0, 2),
+        "peak_gpu_mem_mb": round(peak_mb, 2) if peak_mb is not None else None,
+        "val_perplexity": round(ppl, 3),
+    }
+    return model, results
+```
+
+## Cell 10 (code)
+
+```python
+import evaluate
+bleu = evaluate.load("bleu")
+
+@torch.no_grad()
+def bleu_on_one_sample(model, tokenizer, dataset, device, prompt_tokens=30, cont_tokens=30):
+    model.eval()
+    ids = dataset[0]["input_ids"]
+    prompt_ids = ids[:prompt_tokens]
+    ref_ids = ids[prompt_tokens:prompt_tokens+cont_tokens]
+
+    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+    ref_text = tokenizer.decode(ref_ids, skip_special_tokens=True)
+
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    gen = model.generate(
+        **inputs,
+        max_new_tokens=cont_tokens,
+        do_sample=False
+    )
+    gen_text = tokenizer.decode(gen[0], skip_special_tokens=True)
+
+    # candidate = only the continuation portion (roughly)
+    candidate = gen_text.split()
+    reference = [ref_text.split()]
+
+    score = bleu.compute(predictions=[candidate], references=[reference])
+    model.train()
+    return prompt_text, ref_text, gen_text, score["bleu"]
+```
+
+## Cell 11 (code)
+
+```python
+runs = []
+
+m0, r0 = train_one_run("baseline_fp32", use_amp=False, use_ckpt=False, epochs=1)
+runs.append(r0)
+
+m1, r1 = train_one_run("mixed_precision", use_amp=True, use_ckpt=False, epochs=1)
+runs.append(r1)
+
+m2, r2 = train_one_run("amp_plus_checkpointing", use_amp=True, use_ckpt=True, epochs=1)
+runs.append(r2)
+
+runs
+```
+Output:
+```text
+Loading weights:   0%|          | 0/148 [00:00<?, ?it/s]
+GPT2LMHeadModel LOAD REPORT from: gpt2
+Key                  | Status     |  | 
+---------------------+------------+--+-
+h.{0...11}.attn.bias | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+`loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.
+[baseline_fp32] epoch 0 step 1/300 loss 4.9786
+[baseline_fp32] epoch 0 step 50/300 loss 4.3684
+[baseline_fp32] epoch 0 step 100/300 loss 3.1455
+[baseline_fp32] epoch 0 step 150/300 loss 3.8088
+[baseline_fp32] epoch 0 step 200/300 loss 3.8336
+[baseline_fp32] epoch 0 step 250/300 loss 3.6804
+[baseline_fp32] epoch 0 step 300/300 loss 3.7823
+Loading weights:   0%|          | 0/148 [00:00<?, ?it/s]
+GPT2LMHeadModel LOAD REPORT from: gpt2
+Key                  | Status     |  | 
+---------------------+------------+--+-
+h.{0...11}.attn.bias | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+[mixed_precision] epoch 0 step 1/300 loss 4.3242
+[mixed_precision] epoch 0 step 50/300 loss 3.8912
+[mixed_precision] epoch 0 step 100/300 loss 3.7188
+[mixed_precision] epoch 0 step 150/300 loss 4.1064
+[mixed_precision] epoch 0 step 200/300 loss 3.6311
+[mixed_precision] epoch 0 step 250/300 loss 3.3621
+[mixed_precision] epoch 0 step 300/300 loss 3.5245
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/148 [00:00<?, ?it/s]
+GPT2LMHeadModel LOAD REPORT from: gpt2
+Key                  | Status     |  | 
+---------------------+------------+--+-
+h.{0...11}.attn.bias | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+[amp_plus_checkpointing] epoch 0 step 1/300 loss 4.4466
+[amp_plus_checkpointing] epoch 0 step 50/300 loss 3.8051
+[amp_plus_checkpointing] epoch 0 step 100/300 loss 4.0113
+[amp_plus_checkpointing] epoch 0 step 150/300 loss 4.1325
+[amp_plus_checkpointing] epoch 0 step 200/300 loss 3.3475
+[amp_plus_checkpointing] epoch 0 step 250/300 loss 3.8197
+[amp_plus_checkpointing] epoch 0 step 300/300 loss 3.2242
+[{'run': 'baseline_fp32',
+  'use_amp_requested': False,
+  'use_amp_active': False,
+  'use_ckpt': False,
+  'epochs': 1,
+  'max_steps': 300,
+  'train_time_sec': 1215.12,
+  'peak_gpu_mem_mb': None,
+  'val_perplexity': 33.026},
+ {'run': 'mixed_precision',
+  'use_amp_requested': True,
+  'use_amp_active': False,
+  'use_ckpt': False,
+  'epochs': 1,
+  'max_steps': 300,
+  'train_time_sec': 1453.52,
+  'peak_gpu_mem_mb': None,
+  'val_perplexity': 32.926},
+ {'run': 'amp_plus_checkpointing',
+  'use_amp_requested': True,
+  'use_amp_active': False,
+  'use_ckpt': True,
+  'epochs': 1,
+  'max_steps': 300,
+  'train_time_sec': 1654.75,
+  'peak_gpu_mem_mb': None,
+  'val_perplexity': 32.425}]
+```
+
+## Cell 12 (code)
+
+```python
+import evaluate
+bleu = evaluate.load("bleu")
+
+import torch
+
+@torch.no_grad()
+def bleu_on_one_sample(model, tokenizer, dataset, device, prompt_tokens=30, cont_tokens=30, max_tries=200):
+    """
+    Computes smoothed BLEU on a single sample, but safely:
+    - Skips samples where the reference continuation decodes to empty (padding/EOS only)
+    - Scores only the generated continuation (not prompt+continuation)
+    - Uses smooth=True to avoid BLEU collapsing to 0 too easily
+    """
+    model.eval()
+
+    for idx in range(min(max_tries, len(dataset))):
+        ids = dataset[idx]["input_ids"]
+
+        prompt_ids = ids[:prompt_tokens]
+        ref_ids = ids[prompt_tokens:prompt_tokens + cont_tokens]
+
+        prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True).strip()
+        ref_text = tokenizer.decode(ref_ids, skip_special_tokens=True).strip()
+
+        # Skip empty references (common with padding)
+        if not ref_text:
+            continue
+
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+
+        gen_ids = model.generate(
+            **inputs,
+            max_new_tokens=cont_tokens,
+            do_sample=False
+        )
+
+        # Continuation only
+        prompt_len = inputs["input_ids"].shape[1]
+        gen_cont_ids = gen_ids[0][prompt_len:]
+        gen_cont_text = tokenizer.decode(gen_cont_ids, skip_special_tokens=True).strip()
+
+        if not gen_cont_text:
+            continue
+
+        bleu_score = bleu.compute(
+            predictions=[gen_cont_text],
+            references=[[ref_text]],
+            smooth=True
+        )["bleu"]
+
+        model.train()
+        return prompt_text, ref_text, gen_cont_text, bleu_score
+
+    model.train()
+    raise ValueError("No valid sample found. Increase max_tries or adjust prompt_tokens/cont_tokens.")
+```
+
+## Cell 13 (code)
+
+```python
+import torch
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+prompt, ref, gen, bleu_score = bleu_on_one_sample(m2, tokenizer, val_ds, device)
+
+print("PROMPT:\n", prompt)
+print("\nREFERENCE:\n", ref)
+print("\nGENERATED (continuation only):\n", gen)
+print("\nSmoothed BLEU:", bleu_score)
+```
+Output:
+```text
+Setting `pad_token_id` to `eos_token_id`:50256 for open-end generation.
+PROMPT:
+ Homarus gammarus , known as the European lobster or common lobster , is a species of clawed lobster from the eastern Atlantic Ocean , Mediterranean Sea
+
+REFERENCE:
+ and parts of the Black Sea . It is closely related to the American lobster , H. americanus . It may grow to a length of 60 cm
+
+GENERATED (continuation only):
+ , and the Gulf of Mexico . It is a common lobster in the United States , Canada , and Mexico . It is a common lobster in the United
+
+Smoothed BLEU: 0.10832996189306149
+```
+
+## Cell 14 (code)
+
+```python
+import json, os, time
+
+out_dir = "gpt2_finetuned_outputs"
+os.makedirs(out_dir, exist_ok=True)
+
+m2.save_pretrained(out_dir)
+tokenizer.save_pretrained(out_dir)
+
+with open(os.path.join(out_dir, "run_metrics.json"), "w") as f:
+    json.dump(runs, f, indent=2)
+
+print("Saved to:", out_dir)
+```
+Output:
+```text
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]
+Saved to: gpt2_finetuned_outputs
+```
